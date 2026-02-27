@@ -258,6 +258,7 @@ struct Renderer {
     global_tick: u64,
     show_status: bool,
     status_timer: u64, // ticks remaining to show status
+    status_clear_needed: bool,
     fps: u64,
 }
 
@@ -290,6 +291,7 @@ impl Renderer {
             global_tick: 0,
             show_status: true,
             status_timer: fps * 3, // show for 3 seconds initially
+            status_clear_needed: false,
             fps,
         })
     }
@@ -318,6 +320,9 @@ impl Renderer {
         self.global_tick = self.global_tick.wrapping_add(1);
         if self.status_timer > 0 {
             self.status_timer -= 1;
+            if self.status_timer == 0 {
+                self.status_clear_needed = true;
+            }
         }
 
         let mut rng = rand::thread_rng();
@@ -360,9 +365,10 @@ impl Renderer {
 
     fn poke_status(&mut self) {
         self.status_timer = self.fps * 3; // show for 3 seconds
+        self.status_clear_needed = false;
     }
 
-    fn render(&self, stdout: &mut io::Stdout) -> io::Result<()> {
+    fn render(&mut self, stdout: &mut io::Stdout) -> io::Result<()> {
         // Render each column's trail
         for col in &self.columns {
             if !col.active {
@@ -446,15 +452,15 @@ impl Renderer {
             }
         }
 
-        if self.show_status && self.status_timer > 0 && self.rows > 0 {
-            let status = format!(
-                " 🔮 {} | 🎨 {} | ⚡ {} FPS | Density: {:.2} ",
-                self.rune_set.name(),
-                self.palette.name(),
-                self.fps,
-                self.density
-            );
+        let status = format!(
+            " 🔮 {} | 🎨 {} | ⚡ {} FPS | Density: {:.2} ",
+            self.rune_set.name(),
+            self.palette.name(),
+            self.fps,
+            self.density
+        );
 
+        if self.show_status && self.status_timer > 0 && self.rows > 0 {
             // Draw discrete status bar at bottom right
             let x = self.cols.saturating_sub(status.len() as u16);
             let y = self.rows - 1;
@@ -476,6 +482,12 @@ impl Renderer {
                 }),
                 style::Print(&status)
             )?;
+        } else if self.status_clear_needed && self.rows > 0 {
+            let x = self.cols.saturating_sub(status.len() as u16);
+            let y = self.rows - 1;
+            let spaces = " ".repeat(status.len());
+            queue!(stdout, cursor::MoveTo(x, y), style::Print(&spaces))?;
+            self.status_clear_needed = false;
         }
 
         stdout.flush()
@@ -629,6 +641,8 @@ fn run_loop(
                             renderer.show_status = !renderer.show_status;
                             if renderer.show_status {
                                 renderer.poke_status();
+                            } else {
+                                renderer.status_clear_needed = true;
                             }
                         }
 
