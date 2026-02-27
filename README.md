@@ -62,6 +62,10 @@ While the screensaver is running, you can use the following keys to customize yo
 *   `]` : **Increase Density** (More columns of rain)
 *   `[` : **Decrease Density** (Fewer columns of rain)
 *   `i` : **Toggle Status Bar** (Force ON/OFF)
+*   `Up Arrow` : **Scroll Up**
+*   `Down Arrow` : **Scroll Down** (Default)
+*   `Left Arrow` : **Scroll Left**
+*   `Right Arrow` : **Scroll Right**
 *   `q` or `Esc` : **Quit**
 
 ---
