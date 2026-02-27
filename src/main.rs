@@ -74,6 +74,64 @@ fn random_rune(rng: &mut impl Rng, set: RuneSet) -> char {
     chosen_set[rng.gen_range(0..chosen_set.len())]
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Direction {
+    Down,
+    Up,
+    Left,
+    Right,
+}
+
+impl Direction {
+    fn max_lanes(&self, cols: u16, rows: u16) -> u16 {
+        match self {
+            Direction::Down | Direction::Up => cols,
+            Direction::Left | Direction::Right => rows,
+        }
+    }
+
+    fn max_pos(&self, cols: u16, rows: u16) -> u16 {
+        match self {
+            Direction::Down | Direction::Up => rows,
+            Direction::Left | Direction::Right => cols,
+        }
+    }
+
+    // Convert abstract (lane, pos) to screen (x, y)
+    fn to_screen(&self, lane: u16, pos: i32, cols: u16, rows: u16) -> Option<(u16, u16)> {
+        match self {
+            Direction::Down => {
+                if pos >= 0 && pos < rows as i32 {
+                    Some((lane, pos as u16))
+                } else {
+                    None
+                }
+            }
+            Direction::Up => {
+                if pos >= 0 && pos < rows as i32 {
+                    Some((lane, rows.saturating_sub(1).saturating_sub(pos as u16)))
+                } else {
+                    None
+                }
+            }
+            Direction::Right => {
+                if pos >= 0 && pos < cols as i32 {
+                    Some((pos as u16, lane))
+                } else {
+                    None
+                }
+            }
+            Direction::Left => {
+                if pos >= 0 && pos < cols as i32 {
+                    Some((cols.saturating_sub(1).saturating_sub(pos as u16), lane))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
 // ── Color palettes ────────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
@@ -111,7 +169,7 @@ impl Palette {
 
     /// Return a color for a trail cell. `intensity` goes from 1.0 (head) to 0.0 (tail).
     /// `column_seed` is used for rainbow hue offset.
-    fn color(&self, intensity: f32, column_seed: u8, global_tick: u64, row: i32) -> Color {
+    fn color(&self, intensity: f32, column_seed: u8, global_tick: u64, coordinate: i32) -> Color {
         let i = intensity.clamp(0.0, 1.0);
         match self {
             Palette::Arcane => {
@@ -148,7 +206,7 @@ impl Palette {
             Palette::BlinkingRainbow => {
                 // Highly saturated random hue based on coordinate and time for extreme blinking
                 let pseudo = (global_tick
-                    .wrapping_add(row as u64)
+                    .wrapping_add(coordinate as u64)
                     .wrapping_add(column_seed as u64))
                 .wrapping_mul(1103515245);
                 let hue = (pseudo % 360) as f32;
@@ -179,30 +237,30 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
     )
 }
 
-// ── Column (rain drop) ───────────────────────────────────────────────
+// ── Stream (rain drop) ───────────────────────────────────────────────
 
-struct Column {
-    x: u16,
-    y: i32,           // head position (can be negative = not yet visible)
-    speed: u8,        // ticks between each step (1 = fastest)
-    tick_counter: u8, // counts up to speed
-    trail_len: u16,   // length of visible trail
-    color_seed: u8,   // for rainbow palette variation
+struct Stream {
+    lane: u16,
+    pos: i32, // head position along the direction (increases over time)
+    speed: u8,
+    tick_counter: u8,
+    trail_len: u16,
+    color_seed: u8,
     active: bool,
-    chars: Vec<char>, // pre-generated trail characters
+    chars: Vec<char>,
 }
 
-impl Column {
-    fn new(x: u16, rows: u16, rng: &mut impl Rng, rune_set: RuneSet) -> Self {
-        let trail_len = rng.gen_range(4..=rows.saturating_sub(2).max(6));
+impl Stream {
+    fn new(lane: u16, max_pos: u16, rng: &mut impl Rng, rune_set: RuneSet) -> Self {
+        let trail_len = rng.gen_range(4..=max_pos.saturating_sub(2).max(6));
         let speed = rng.gen_range(1..=4_u8);
         let mut chars = Vec::with_capacity(trail_len as usize);
         for _ in 0..trail_len {
             chars.push(random_rune(rng, rune_set));
         }
-        Column {
-            x,
-            y: -(rng.gen_range(0..rows as i32)),
+        Stream {
+            lane,
+            pos: -(rng.gen_range(0..(max_pos as i32).max(1))),
             speed,
             tick_counter: 0,
             trail_len,
@@ -212,12 +270,12 @@ impl Column {
         }
     }
 
-    fn reset(&mut self, x: u16, rows: u16, rng: &mut impl Rng, rune_set: RuneSet) {
-        self.x = x;
-        self.y = -(rng.gen_range(0..(rows as i32).max(1)));
+    fn reset(&mut self, lane: u16, max_pos: u16, rng: &mut impl Rng, rune_set: RuneSet) {
+        self.lane = lane;
+        self.pos = -(rng.gen_range(0..(max_pos as i32).max(1)));
         self.speed = rng.gen_range(1..=4);
         self.tick_counter = 0;
-        self.trail_len = rng.gen_range(4..=rows.saturating_sub(2).max(6));
+        self.trail_len = rng.gen_range(4..=max_pos.saturating_sub(2).max(6));
         self.color_seed = rng.gen();
         self.chars.clear();
         for _ in 0..self.trail_len {
@@ -226,20 +284,18 @@ impl Column {
         self.active = true;
     }
 
-    fn tick(&mut self, rows: u16, rng: &mut impl Rng, rune_set: RuneSet) {
+    fn tick(&mut self, max_pos: u16, rng: &mut impl Rng, rune_set: RuneSet) {
         self.tick_counter += 1;
         if self.tick_counter >= self.speed {
             self.tick_counter = 0;
-            self.y += 1;
+            self.pos += 1;
 
-            // Randomly mutate one character in the trail for visual shimmer
             if !self.chars.is_empty() && rng.gen_ratio(1, 5) {
                 let idx = rng.gen_range(0..self.chars.len());
                 self.chars[idx] = random_rune(rng, rune_set);
             }
 
-            // If entire trail has scrolled past the bottom, reset
-            if self.y - self.trail_len as i32 > rows as i32 {
+            if self.pos - self.trail_len as i32 > max_pos as i32 {
                 self.active = false;
             }
         }
@@ -251,10 +307,11 @@ impl Column {
 struct Renderer {
     cols: u16,
     rows: u16,
-    columns: Vec<Column>,
+    direction: Direction,
+    streams: Vec<Stream>,
     palette: Palette,
     rune_set: RuneSet,
-    density: f32, // fraction of terminal columns that have active rain (0..1)
+    density: f32, // fraction of max lanes that have active rain
     global_tick: u64,
     show_status: bool,
     status_timer: u64, // ticks remaining to show status
@@ -265,54 +322,46 @@ struct Renderer {
 impl Renderer {
     fn new(palette: Palette, density: f32, fps: u64) -> io::Result<Self> {
         let (cols, rows) = terminal::size()?;
-        let mut rng = rand::thread_rng();
-        let active_count = ((cols as f32 * density) as usize).max(1);
+        let direction = Direction::Down;
         let rune_set = RuneSet::All;
 
-        let mut columns = Vec::new();
-        // Distribute rain columns across the terminal width
-        let mut available: Vec<u16> = (0..cols).collect();
-        for _ in 0..active_count.min(cols as usize) {
-            if available.is_empty() {
-                break;
-            }
-            let idx = rng.gen_range(0..available.len());
-            let x = available.swap_remove(idx);
-            columns.push(Column::new(x, rows, &mut rng, rune_set));
-        }
-
-        Ok(Renderer {
+        let mut renderer = Renderer {
             cols,
             rows,
-            columns,
+            direction,
+            streams: Vec::new(),
             palette,
             rune_set,
             density,
             global_tick: 0,
             show_status: true,
-            status_timer: fps * 3, // show for 3 seconds initially
+            status_timer: fps * 3,
             status_clear_needed: false,
             fps,
-        })
+        };
+
+        renderer.resize(cols, rows);
+        Ok(renderer)
     }
 
     fn resize(&mut self, new_cols: u16, new_rows: u16) {
         self.cols = new_cols;
         self.rows = new_rows;
         let mut rng = rand::thread_rng();
-        let target = ((new_cols as f32 * self.density) as usize).max(1);
+        let max_lanes = self.direction.max_lanes(self.cols, self.rows);
+        let max_pos = self.direction.max_pos(self.cols, self.rows);
+        let target = ((max_lanes as f32 * self.density) as usize).max(1);
 
-        // Rebuild columns
-        self.columns.clear();
-        let mut available: Vec<u16> = (0..new_cols).collect();
-        for _ in 0..target.min(new_cols as usize) {
+        self.streams.clear();
+        let mut available: Vec<u16> = (0..max_lanes).collect();
+        for _ in 0..target.min(max_lanes as usize) {
             if available.is_empty() {
                 break;
             }
             let idx = rng.gen_range(0..available.len());
-            let x = available.swap_remove(idx);
-            self.columns
-                .push(Column::new(x, new_rows, &mut rng, self.rune_set));
+            let lane = available.swap_remove(idx);
+            self.streams
+                .push(Stream::new(lane, max_pos, &mut rng, self.rune_set));
         }
     }
 
@@ -326,33 +375,31 @@ impl Renderer {
         }
 
         let mut rng = rand::thread_rng();
+        let max_lanes = self.direction.max_lanes(self.cols, self.rows);
+        let max_pos = self.direction.max_pos(self.cols, self.rows);
 
-        // Track which columns currently have active drops to avoid spawning on top of existing ones
-        let mut occupied = vec![false; self.cols as usize];
-        for col in &mut self.columns {
-            col.tick(self.rows, &mut rng, self.rune_set);
-            if col.active && (col.x as usize) < occupied.len() {
-                occupied[col.x as usize] = true;
+        let mut occupied = vec![false; max_lanes as usize];
+        for stream in &mut self.streams {
+            stream.tick(max_pos, &mut rng, self.rune_set);
+            if stream.active && (stream.lane as usize) < occupied.len() {
+                occupied[stream.lane as usize] = true;
             }
         }
 
-        // Gather all free X coordinates
-        let mut free_x: Vec<u16> = (0..self.cols).filter(|&x| !occupied[x as usize]).collect();
+        let mut free_lanes: Vec<u16> = (0..max_lanes).filter(|&l| !occupied[l as usize]).collect();
 
-        // Re-activate dead columns
-        for col in &mut self.columns {
-            if !col.active {
-                // Pick a new random X coordinate that isn't currently occupied if possible
-                let new_x = if !free_x.is_empty() {
-                    let idx = rng.gen_range(0..free_x.len());
-                    free_x.swap_remove(idx)
+        for stream in &mut self.streams {
+            if !stream.active {
+                let new_lane = if !free_lanes.is_empty() {
+                    let idx = rng.gen_range(0..free_lanes.len());
+                    free_lanes.swap_remove(idx)
                 } else {
-                    rng.gen_range(0..self.cols.max(1))
+                    rng.gen_range(0..max_lanes.max(1))
                 };
 
-                col.reset(new_x, self.rows, &mut rng, self.rune_set);
-                if (new_x as usize) < occupied.len() {
-                    occupied[new_x as usize] = true;
+                stream.reset(new_lane, max_pos, &mut rng, self.rune_set);
+                if (new_lane as usize) < occupied.len() {
+                    occupied[new_lane as usize] = true;
                 }
             }
         }
@@ -360,7 +407,15 @@ impl Renderer {
 
     fn change_density(&mut self, delta: f32) {
         self.density = (self.density + delta).clamp(0.05, 1.0);
-        self.resize(self.cols, self.rows); // Rebuild columns with new density
+        self.resize(self.cols, self.rows);
+    }
+
+    fn change_direction(&mut self, new_dir: Direction) {
+        if self.direction != new_dir {
+            self.direction = new_dir;
+            self.status_clear_needed = true;
+            self.resize(self.cols, self.rows);
+        }
     }
 
     fn poke_status(&mut self) {
@@ -369,42 +424,49 @@ impl Renderer {
     }
 
     fn render(&mut self, stdout: &mut io::Stdout) -> io::Result<()> {
-        // Render each column's trail
-        for col in &self.columns {
-            if !col.active {
+        for stream in &self.streams {
+            if !stream.active {
                 continue;
             }
-            for i in 0..col.trail_len as i32 {
-                let row = col.y - i;
-                if row < 0 || row >= self.rows as i32 {
-                    continue;
+            for i in 0..stream.trail_len as i32 {
+                let current_pos = stream.pos - i;
+                if let Some((x, y)) =
+                    self.direction
+                        .to_screen(stream.lane, current_pos, self.cols, self.rows)
+                {
+                    let intensity = 1.0 - (i as f32 / stream.trail_len as f32);
+                    let color = self.palette.color(
+                        intensity,
+                        stream.color_seed,
+                        self.global_tick,
+                        stream.pos,
+                    );
+                    let ch = stream.chars.get(i as usize).copied().unwrap_or('ᚠ');
+
+                    queue!(
+                        stdout,
+                        cursor::MoveTo(x, y),
+                        SetForegroundColor(color),
+                        style::Print(ch)
+                    )?;
                 }
-                let intensity = 1.0 - (i as f32 / col.trail_len as f32);
-                let color = self
-                    .palette
-                    .color(intensity, col.color_seed, self.global_tick, row);
-                let ch = col.chars.get(i as usize).copied().unwrap_or('ᚠ');
-
-                queue!(
-                    stdout,
-                    cursor::MoveTo(col.x, row as u16),
-                    SetForegroundColor(color),
-                    style::Print(ch)
-                )?;
             }
 
-            // Clear the cell just above the tail (erase old trail)
-            let erase_row = col.y - col.trail_len as i32;
-            if erase_row >= 0 && erase_row < self.rows as i32 {
-                queue!(
-                    stdout,
-                    cursor::MoveTo(col.x, erase_row as u16),
-                    style::Print(' ')
-                )?;
+            // Erase old trail
+            if let Some((x, y)) = self.direction.to_screen(
+                stream.lane,
+                stream.pos - stream.trail_len as i32,
+                self.cols,
+                self.rows,
+            ) {
+                queue!(stdout, cursor::MoveTo(x, y), style::Print(' '))?;
             }
 
-            // Bright white head character (glow effect)
-            if col.y >= 0 && col.y < self.rows as i32 {
+            // Head glow
+            if let Some((x, y)) =
+                self.direction
+                    .to_screen(stream.lane, stream.pos, self.cols, self.rows)
+            {
                 let head_color = match self.palette {
                     Palette::Arcane => Color::Rgb {
                         r: 230,
@@ -434,18 +496,18 @@ impl Renderer {
                     Palette::BlinkingRainbow => {
                         let pseudo = (self
                             .global_tick
-                            .wrapping_add(col.y as u64)
-                            .wrapping_add(col.color_seed as u64))
+                            .wrapping_add(stream.pos as u64)
+                            .wrapping_add(stream.color_seed as u64))
                         .wrapping_mul(1103515245);
                         let hue = (pseudo % 360) as f32;
                         let (r, g, b) = hsl_to_rgb(hue, 1.0, 0.8);
                         Color::Rgb { r, g, b }
                     }
                 };
-                let head_ch = col.chars.first().copied().unwrap_or('ᛟ');
+                let head_ch = stream.chars.first().copied().unwrap_or('ᛟ');
                 queue!(
                     stdout,
-                    cursor::MoveTo(col.x, col.y as u16),
+                    cursor::MoveTo(x, y),
                     SetForegroundColor(head_color),
                     style::Print(head_ch)
                 )?;
@@ -635,6 +697,24 @@ fn run_loop(
                         KeyCode::Char('s') => renderer.rune_set = RuneSet::Anglo,
                         KeyCode::Char('o') => renderer.rune_set = RuneSet::Ogham,
                         KeyCode::Char('m') => renderer.rune_set = RuneSet::Mystic,
+
+                        // Directions
+                        KeyCode::Up => {
+                            execute!(stdout, terminal::Clear(ClearType::All)).ok();
+                            renderer.change_direction(Direction::Up);
+                        }
+                        KeyCode::Down => {
+                            execute!(stdout, terminal::Clear(ClearType::All)).ok();
+                            renderer.change_direction(Direction::Down);
+                        }
+                        KeyCode::Left => {
+                            execute!(stdout, terminal::Clear(ClearType::All)).ok();
+                            renderer.change_direction(Direction::Left);
+                        }
+                        KeyCode::Right => {
+                            execute!(stdout, terminal::Clear(ClearType::All)).ok();
+                            renderer.change_direction(Direction::Right);
+                        }
 
                         // UI toggles
                         KeyCode::Char('i') => {
